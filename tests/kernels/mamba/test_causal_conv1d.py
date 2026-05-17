@@ -264,6 +264,69 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
+def test_causal_conv1d_update_allows_padded_batch_larger_than_cache_lines():
+    device = "cuda"
+    set_random_seed(0)
+
+    batch_size = 3
+    padding = 5
+    padded_batch_size = batch_size + padding
+    dim = 2048
+    width = 4
+    seqlen = 1
+    dtype = torch.bfloat16
+
+    x = torch.randn(padded_batch_size, dim, seqlen, device=device, dtype=dtype)
+    x_ref = x.clone()
+    conv_state = torch.randn(
+        batch_size + 1,
+        dim,
+        width - 1,
+        device=device,
+        dtype=dtype,
+    )
+    null_block_snapshot = conv_state.clone()
+
+    conv_state_indices = torch.arange(
+        1,
+        batch_size + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    padded_state_indices = torch.concat(
+        [
+            conv_state_indices,
+            torch.full((padding,), NULL_BLOCK_ID, dtype=torch.int32, device=device),
+        ],
+        dim=0,
+    )
+
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    conv_state_ref = conv_state[conv_state_indices].detach().clone()
+
+    out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=padded_state_indices,
+        validate_data=True,
+    )
+    out_ref = causal_conv1d_update_ref(
+        x_ref[:batch_size],
+        conv_state_ref,
+        weight,
+        bias,
+        activation="silu",
+    )
+
+    assert torch.equal(conv_state[conv_state_indices], conv_state_ref)
+    assert torch.equal(conv_state[0], null_block_snapshot[0])
+    assert torch.allclose(out[:batch_size], out_ref, rtol=1e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])

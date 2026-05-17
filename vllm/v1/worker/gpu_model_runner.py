@@ -227,6 +227,68 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _get_num_kv_blocks_for_cudagraph_profiling(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    max_capture_size: int,
+) -> int:
+    """Return the minimal temporary KV cache size for graph profiling.
+
+    CUDA graph memory profiling captures dummy runs only to measure the graph
+    pool. The dummy runs do not allocate real request blocks: slot mappings are
+    marked as padding and block tables point at block 0. Therefore the temporary
+    KV cache only needs enough physical blocks to provide valid storage for the
+    dummy metadata, not one KV block per captured token.
+    """
+
+    def get_mamba_specs(spec: KVCacheSpec) -> list[MambaSpec]:
+        if isinstance(spec, MambaSpec):
+            return [spec]
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            return [
+                child
+                for child in spec.kv_cache_specs.values()
+                if isinstance(child, MambaSpec)
+            ]
+        return []
+
+    has_mamba_group = any(
+        get_mamba_specs(group.kv_cache_spec) for group in kv_cache_groups
+    )
+    if not has_mamba_group:
+        return max(1, max_capture_size)
+
+    num_blocks = 1
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, EncoderOnlyAttentionSpec):
+            continue
+
+        # Attention cache pages store `block_size` tokens, so a token capture
+        # size should be converted to pages. This is especially important for
+        # hybrid Mamba or Gated DeltaNet models, where attention pages can be
+        # padded to multi-MiB to match Mamba state pages.
+        group_blocks = cdiv(max_capture_size, spec.block_size)
+
+        mamba_specs = get_mamba_specs(spec)
+        if mamba_specs:
+            num_speculative_blocks = max(
+                mamba_spec.num_speculative_blocks for mamba_spec in mamba_specs
+            )
+            # Non-prefix-cached Mamba keeps a single state block per
+            # request; align mode may need both previous and current states.
+            # Speculative blocks add extra state slots.
+            if vllm_config.cache_config.mamba_cache_mode == "align":
+                group_blocks = max(group_blocks, 2 + num_speculative_blocks)
+            elif vllm_config.cache_config.mamba_cache_mode == "none":
+                group_blocks = max(group_blocks, 1 + num_speculative_blocks)
+
+        num_blocks = max(num_blocks, group_blocks)
+
+    return num_blocks
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -6114,9 +6176,11 @@ class GPUModelRunner(
 
         kv_cache_spec = self.get_kv_cache_spec()
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
+        max_capture_size = self.compilation_config.max_cudagraph_capture_size or 1
+        min_blocks = _get_num_kv_blocks_for_cudagraph_profiling(
+            self.vllm_config, kv_cache_groups, max_capture_size
+        )
 
-        # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
         minimal_config = get_kv_cache_config_from_groups(
@@ -6125,9 +6189,8 @@ class GPUModelRunner(
         self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
-        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
-        logger.debug("Initialized minimal KV cache for CUDA graph profiling")
+        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
     @staticmethod
     @contextmanager
@@ -6193,98 +6256,106 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
-
+        original_pools: dict[int, Any] = {}
+        remove_profile_loras = False
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
-        capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
 
-        total_graphs = sum(len(descs) for _, descs in capture_descs)
-        if total_graphs == 0:
-            logger.debug("No CUDA graphs will be captured, skipping profiling")
-            self._cleanup_profiling_kv_cache()
-            return 0
+            capture_descs = self.cudagraph_dispatcher.get_capture_descs()
 
-        logger.info(
-            "Profiling CUDA graph memory: %s",
-            ", ".join(
-                f"{mode.name}={len(descs)} (largest={descs[0].num_tokens})"
-                for mode, descs in capture_descs
-                if descs
-            ),
-        )
+            total_graphs = sum(len(descs) for _, descs in capture_descs)
+            if total_graphs == 0:
+                logger.debug("No CUDA graphs will be captured, skipping profiling")
+                return 0
+            remove_profile_loras = True
 
-        # Use a temporary pool for profiling to avoid fragmentation in the main pool.
-        profiling_pool = current_platform.graph_pool_handle()
-        original_pools: dict[int, Any] = {}
-        all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-            BreakableCUDAGraphWrapper._all_instances
-        )
-        for instance in all_wrappers:
-            original_pools[id(instance)] = instance.graph_pool
-            instance.graph_pool = profiling_pool
+            logger.info(
+                "Profiling CUDA graph memory: %s",
+                ", ".join(
+                    f"{mode.name}={len(descs)} (largest={descs[0].num_tokens})"
+                    for mode, descs in capture_descs
+                    if descs
+                ),
+            )
 
-        set_cudagraph_capturing_enabled(True)
-        with self._freeze_gc(), graph_capture(device=self.device):
-            shared_memory_estimate = {}
-            per_graph_estimate = {}
-            torch.accelerator.synchronize()
-            torch.accelerator.empty_cache()
+            # Use a temporary pool for profiling to avoid fragmentation
+            # in the main pool.
+            profiling_pool = current_platform.graph_pool_handle()
+            all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                BreakableCUDAGraphWrapper._all_instances
+            )
+            for instance in all_wrappers:
+                original_pools[id(instance)] = instance.graph_pool
+                instance.graph_pool = profiling_pool
 
-            for mode, descs in capture_descs:
-                profile_descs = descs[:2]
-                mem_samples: list[int] = []
+            set_cudagraph_capturing_enabled(True)
+            with self._freeze_gc(), graph_capture(device=self.device):
+                shared_memory_estimate = {}
+                per_graph_estimate = {}
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
 
-                for i, desc in enumerate(profile_descs):
-                    mem_before = torch.cuda.mem_get_info()[0]
-                    self._warmup_and_capture(
-                        desc,
-                        cudagraph_runtime_mode=mode,
-                        profile_seq_lens=(
-                            min(
-                                self.max_model_len,
-                                self.max_num_tokens // desc.num_tokens,
-                            )
-                            if mode == CUDAGraphMode.FULL and i == 0
-                            else None
-                        ),
+                for mode, descs in capture_descs:
+                    profile_descs = descs[:2]
+                    mem_samples: list[int] = []
+
+                    for i, desc in enumerate(profile_descs):
+                        mem_before = torch.cuda.mem_get_info()[0]
+                        self._warmup_and_capture(
+                            desc,
+                            cudagraph_runtime_mode=mode,
+                            profile_seq_lens=(
+                                min(
+                                    self.max_model_len,
+                                    self.max_num_tokens // desc.num_tokens,
+                                )
+                                if mode == CUDAGraphMode.FULL and i == 0
+                                else None
+                            ),
+                        )
+                        torch.accelerator.synchronize()
+                        free_after = torch.cuda.mem_get_info()[0]
+                        mem_samples.append(mem_before - free_after)
+
+                    first_capture = mem_samples[0]
+                    # Use at least 1 MiB per graph for driver overhead
+                    per_graph = max(
+                        mem_samples[1] if len(mem_samples) > 1 else 0,
+                        1 << 20,
                     )
-                    torch.accelerator.synchronize()
-                    free_after = torch.cuda.mem_get_info()[0]
-                    mem_samples.append(mem_before - free_after)
 
-                first_capture = mem_samples[0]
-                # Use at least 1 MiB per graph for driver overhead
-                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+                    shared_memory_estimate[mode] = first_capture
+                    per_graph_estimate[mode] = per_graph * (len(descs) - 1)
 
-                shared_memory_estimate[mode] = first_capture
-                per_graph_estimate[mode] = per_graph * (len(descs) - 1)
-
-                logger.debug(
-                    "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
-                    mode.name,
-                    first_capture / (1 << 20),
-                    len(descs),
-                    per_graph / (1 << 20),
-                )
-
-        set_cudagraph_capturing_enabled(False)
-        CUDAGraphWrapper.clear_all_graphs()
-        BreakableCUDAGraphWrapper.clear_all_graphs()
-        all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-            BreakableCUDAGraphWrapper._all_instances
-        )
-        for instance in all_wrappers:
-            if id(instance) in original_pools:
-                instance.graph_pool = original_pools[id(instance)]
-        for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
-            key_set.clear()
-        self.cudagraph_dispatcher.keys_initialized = False
-        self.maybe_remove_all_loras(self.lora_config)
-        self._cleanup_profiling_kv_cache()
-        compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+                    logger.debug(
+                        "Estimated %s CUDA graph memory: "
+                        "%.2f MiB first-capture + (%d-1) × %.2f MiB "
+                        "per-graph",
+                        mode.name,
+                        first_capture / (1 << 20),
+                        len(descs),
+                        per_graph / (1 << 20),
+                    )
+        finally:
+            set_cudagraph_capturing_enabled(False)
+            CUDAGraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
+            all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                BreakableCUDAGraphWrapper._all_instances
+            )
+            for instance in all_wrappers:
+                if id(instance) in original_pools:
+                    instance.graph_pool = original_pools[id(instance)]
+            for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+                key_set.clear()
+            self.cudagraph_dispatcher.keys_initialized = False
+            if remove_profile_loras:
+                self.maybe_remove_all_loras(self.lora_config)
+            self._cleanup_profiling_kv_cache()
+            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.
@@ -7078,7 +7149,9 @@ class GPUModelRunner(
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )
@@ -7087,6 +7160,7 @@ class GPUModelRunner(
         # backends for that group only supports block_size 64, we will return
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
+
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config, self.attn_groups
         )

@@ -404,7 +404,22 @@ class Worker(WorkerBase):
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
-                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                try:
+                    cudagraph_memory_estimate = (
+                        self.model_runner.profile_cudagraph_memory()
+                    )
+                except torch.OutOfMemoryError:
+                    logger.warning(
+                        "CUDA graph memory profiling failed due to "
+                        "insufficient GPU memory. Continuing without "
+                        "the estimate. CUDA graphs will still be captured "
+                        "later by capture_model(). If graph capture also "
+                        "fails later, lower --gpu-memory-utilization or use "
+                        "--enforce-eager to disable CUDA graphs."
+                    )
+                    torch.accelerator.synchronize()
+                    torch.accelerator.empty_cache()
+                    cudagraph_memory_estimate = 0
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
